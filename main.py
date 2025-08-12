@@ -38,13 +38,40 @@ app_image = (
         "fastapi[standard]",
         "uvicorn",
     )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Persist HF cache on the /models volume
+        "HF_HOME": "/models/hf-home",
+        "HF_HUB_CACHE": "/models/hf-cache",
+        "TRANSFORMERS_CACHE": "/models/hf-cache",
+    })
 )
 
 # Create the Modal app
 app = modal.App("dhya-persona-rag-pipeline", image=app_image)
 
 # --- 2. Model Download and Management ---
+
+def get_local_model_dir(model_id: str) -> str:
+    """Return a local directory path for the given model id.
+    Prefer the persistent volume under /models. If missing weights, fall back to HF cache.
+    """
+    import os
+    try:
+        # Preferred: persistent volume path
+        persistent_dir = f"/models/{model_id}"
+        if os.path.isdir(persistent_dir):
+            # Only use persistent dir if it actually contains weights
+            for root, _, files in os.walk(persistent_dir):
+                if any(f.endswith((".safetensors", ".bin")) for f in files):
+                    return persistent_dir
+        # Fallback: ensure in HF cache and use that path
+        from huggingface_hub import snapshot_download
+        cached_dir = snapshot_download(repo_id=model_id, local_dir=None, local_dir_use_symlinks=True)
+        return cached_dir
+    except Exception:
+        # As a last resort, return the persistent dir so errors surface clearly later
+        return f"/models/{model_id}"
 
 @app.function(volumes={"/models": model_volume}, timeout=3600)
 def download_models():
@@ -57,13 +84,9 @@ def download_models():
     for model_name, model_id in MODEL_CONFIG.items():
         print(f"Downloading {model_name}: {model_id}")
         try:
-            snapshot_download(
-                repo_id=model_id,
-                # Store under the repo id so agents can load with /models/<repo_id>
-                local_dir=f"/models/{model_id}",
-                local_dir_use_symlinks=False,
-            )
-            print(f"✅ Downloaded {model_name}")
+            # With cache env pointing to /models/hf-cache, this persists on the volume
+            cached_dir = snapshot_download(repo_id=model_id, local_dir=None, local_dir_use_symlinks=True)
+            print(f"✅ Cached {model_name} at {cached_dir}")
         except Exception as e:
             print(f"❌ Failed to download {model_name}: {e}")
             raise
@@ -86,9 +109,11 @@ class OrchestratorAgent:
         print("Loading orchestrator model...")
         start_time = time.time()
         
-        model_path = f"/models/{MODEL_CONFIG['orchestrator_model']}"
+        model_id = MODEL_CONFIG['orchestrator_model']
+        print(f"Resolved orchestrator model id: {model_id}")
         engine_args = AsyncEngineArgs(
-            model=model_path,
+            model=model_id,
+            download_dir="/models",
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             trust_remote_code=True,
@@ -157,9 +182,11 @@ class RouterAgent:
         print("Loading router model...")
         start_time = time.time()
         
-        model_path = f"/models/{MODEL_CONFIG['router_model']}"
+        model_id = MODEL_CONFIG['router_model']
+        print(f"Resolved router model id: {model_id}")
         engine_args = AsyncEngineArgs(
-            model=model_path,
+            model=model_id,
+            download_dir="/models",
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             trust_remote_code=True,
@@ -228,9 +255,11 @@ class RetrievalAgent:
         print("Loading retrieval model...")
         start_time = time.time()
         
-        model_path = f"/models/{MODEL_CONFIG['retrieval_model']}"
+        model_id = MODEL_CONFIG['retrieval_model']
+        print(f"Resolved retrieval model id: {model_id}")
         engine_args = AsyncEngineArgs(
-            model=model_path,
+            model=model_id,
+            download_dir="/models",
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             trust_remote_code=True,
@@ -299,9 +328,11 @@ class SynthesisAgent:
         print("Loading synthesis model...")
         start_time = time.time()
         
-        model_path = f"/models/{MODEL_CONFIG['synthesis_model']}"
+        model_id = MODEL_CONFIG['synthesis_model']
+        print(f"Resolved synthesis model id: {model_id}")
         engine_args = AsyncEngineArgs(
-            model=model_path,
+            model=model_id,
+            download_dir="/models",
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             trust_remote_code=True,
