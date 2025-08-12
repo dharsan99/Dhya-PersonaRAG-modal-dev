@@ -12,16 +12,17 @@ import os
 from typing import Dict, TypedDict
 from langgraph.graph import StateGraph, END
 
-# Model configuration - using tiny models for faster performance
+# Model configuration - using a small model supported by vLLM
 MODEL_CONFIG = {
-    "orchestrator_model": "microsoft/DialoGPT-small",  # Very small model (117M parameters)
-    "router_model": "microsoft/DialoGPT-small",        # Very small model
-    "retrieval_model": "microsoft/DialoGPT-small",     # Very small model
-    "synthesis_model": "microsoft/DialoGPT-small"      # Very small model
+    "orchestrator_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "router_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "retrieval_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "synthesis_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
 }
 
 # Create persistent volumes for model storage
-model_volume = modal.Volume.from_name("persona-rag-models", create_if_missing=True)
+# Standardize to a single volume name used across scripts
+model_volume = modal.Volume.from_name("llm-models-vol", create_if_missing=True)
 lora_volume = modal.Volume.from_name("persona-rag-loras", create_if_missing=True)
 
 # Define the container image with all required dependencies
@@ -58,9 +59,9 @@ def download_models():
         try:
             snapshot_download(
                 repo_id=model_id,
-                local_dir=f"/models/{model_name}",
+                # Store under the repo id so agents can load with /models/<repo_id>
+                local_dir=f"/models/{model_id}",
                 local_dir_use_symlinks=False,
-                ignore_patterns=["*.md", "*.txt", "*.h5", "*.msgpack"]
             )
             print(f"✅ Downloaded {model_name}")
         except Exception as e:
@@ -143,7 +144,7 @@ class OrchestratorAgent:
         async for request_output in results_generator:
             final_output = request_output
             
-        return final_output.outputs.text
+        return final_output.outputs[0].text
 
 @app.cls(gpu="A10G", volumes={"/models": model_volume}, scaledown_window=300)
 class RouterAgent:
@@ -214,7 +215,7 @@ class RouterAgent:
         async for request_output in results_generator:
             final_output = request_output
             
-        return final_output.outputs.text
+        return final_output.outputs[0].text
 
 @app.cls(gpu="A10G", volumes={"/models": model_volume}, scaledown_window=300)
 class RetrievalAgent:
@@ -285,7 +286,7 @@ class RetrievalAgent:
         async for request_output in results_generator:
             final_output = request_output
             
-        return final_output.outputs.text
+        return final_output.outputs[0].text
 
 @app.cls(gpu="A10G", volumes={"/models": model_volume}, scaledown_window=300)
 class SynthesisAgent:
@@ -361,7 +362,7 @@ class SynthesisAgent:
         async for request_output in results_generator:
             final_output = request_output
             
-        return final_output.outputs.text
+        return final_output.outputs[0].text
 
 # --- 4. Orchestration and Web Endpoint ---
 

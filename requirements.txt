@@ -1,8 +1,7 @@
-vllm==0.4.0
 huggingface_hub==0.22.2
-hf-transfer==0.1.6
-torch==2.1.2
 langgraph==0.0.44
 numpy<2.0.0
 fastapi[standard]
 uvicorn 
+langchain
+requests

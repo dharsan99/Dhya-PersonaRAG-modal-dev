@@ -6,12 +6,12 @@ This script downloads all required models to the Modal volume before deployment
 
 import modal
 
-# Define the models we'll be using
+# Define the models we'll be using (aligned with main.py)
 MODEL_CONFIG = {
-    "synthesis_model": "meta-llama/Llama-3.1-8B-Instruct",
-    "orchestrator_model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-    "router_model": "mistralai/Mistral-7B-Instruct-v0.3",
-    "retrieval_model": "Qwen/Qwen1.5-7B-Chat",
+    "synthesis_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "orchestrator_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "router_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "retrieval_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
 }
 
 # Define persistent storage volume for model weights
