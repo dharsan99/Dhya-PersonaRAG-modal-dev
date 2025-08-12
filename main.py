@@ -2,6 +2,8 @@
 import modal
 import os
 from typing import Dict, TypedDict, Annotated
+import uuid
+import time
 from langgraph.graph import StateGraph, END
 import operator
 
@@ -30,9 +32,10 @@ app_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "vllm==0.4.0",
-        "huggingface_hub==0.22.2",
+        "huggingface_hub>=0.23.0,<1.0.0",
         "hf-transfer==0.1.6",
         "torch==2.1.2",
+        "transformers==4.41.1",
         "langgraph==0.0.44",
         "numpy<2.0.0",
         "fastapi[standard]",
@@ -49,6 +52,9 @@ app_image = (
 
 # Create the Modal app
 app = modal.App("dhya-persona-rag-pipeline", image=app_image)
+
+# Simple job store for streaming planner outputs
+planner_jobs = modal.Dict.from_name("planner-jobs", create_if_missing=True)
 
 # --- 2. Model Download and Management ---
 
@@ -170,6 +176,46 @@ class OrchestratorAgent:
             final_output = request_output
             
         return final_output.outputs[0].text
+
+    @modal.method()
+    async def start_plan_stream(self, job_id: str, query: str, persona_context: str) -> None:
+        from vllm.sampling_params import SamplingParams
+        from vllm.utils import random_uuid
+        import asyncio
+
+        prompt = f"""
+        You are a research planning agent. Create a detailed, step-by-step research plan for the query.
+        Persona Context: {persona_context}
+        Query: {query}
+
+        Plan:
+        """
+        sampling_params = SamplingParams(temperature=0.3, max_tokens=512)
+        request_id = random_uuid()
+        accumulated = ""
+
+        try:
+            results_generator = self.engine.generate(prompt, sampling_params, request_id)
+            async for request_output in results_generator:
+                text = request_output.outputs[0].text
+                delta = text[len(accumulated):]
+                accumulated = text
+                if delta:
+                    # Append chunk safely
+                    with planner_jobs.batch_update() as batch:
+                        job = planner_jobs.get(job_id, {"chunks": [], "done": False, "error": None})
+                        job["chunks"].append(delta)
+                        batch[job_id] = job
+            with planner_jobs.batch_update() as batch:
+                job = planner_jobs.get(job_id, {"chunks": [], "done": False, "error": None})
+                job["done"] = True
+                batch[job_id] = job
+        except Exception as e:
+            with planner_jobs.batch_update() as batch:
+                job = planner_jobs.get(job_id, {"chunks": [], "done": True, "error": str(e)})
+                job["error"] = str(e)
+                job["done"] = True
+                batch[job_id] = job
 
 @app.cls(gpu="A10G", volumes={"/models": model_volume}, scaledown_window=300)
 class RouterAgent:
@@ -405,6 +451,34 @@ class AgentState(TypedDict):
     research_report: str
     final_response: str
     next_agent: str
+@app.function(volumes={"/models": model_volume})
+def quick_plan(query: str, persona_context: str) -> str:
+    """CPU-friendly fallback planner using HF Transformers. Returns a short plan string."""
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+
+    model_id = MODEL_CONFIG["orchestrator_model"]
+    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir="/models/hf-cache", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        cache_dir="/models/hf-cache",
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+    )
+
+    prompt = (
+        "You are a research planning agent. Create a short, step-by-step research plan for the query.\n"
+        f"Persona Context: {persona_context}\n"
+        f"Query: {query}\n"
+        "Plan:"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Return only the generated continuation after "Plan:"
+    return text.split("Plan:", 1)[-1].strip()
+
 
 @app.cls(cpu=4.0)
 class PersonaRAG:
@@ -479,16 +553,51 @@ class PersonaRAG:
             
             persona_context = "An expert financial auditor who is direct and provides source-backed information."
 
-            # For now, let's use a simplified approach that doesn't require the full workflow
-            # This will help us test if the basic model loading works
+            # GPU planner via job queue with CPU fallback
+            job_id = str(uuid.uuid4())
+            # Initialize job record
+            planner_jobs[job_id] = {"chunks": [], "done": False, "error": None}
+
             try:
-                # Use the orchestrator directly for a simple response
                 orchestrator = OrchestratorAgent()
-                response = orchestrator.create_research_plan.remote(query, persona_context)
-                
-                return {"response": response}
-            except Exception as workflow_error:
-                return {"error": f"Model execution failed: {str(workflow_error)}"}
+                orchestrator.start_plan_stream.remote(job_id, query, persona_context)
+            except Exception as e:
+                # Fallback immediately on failure to start GPU job
+                fallback = quick_plan.remote(query, persona_context)
+                return {"response": fallback, "mode": "cpu_fallback"}
+
+            # Poll for streamed chunks with timeout; if GPU fails, use fallback
+            start = time.time()
+            timeout_s = 60
+            last_len = 0
+            while time.time() - start < timeout_s:
+                job = planner_jobs.get(job_id)
+                if not job:
+                    break
+                chunks = job.get("chunks", [])
+                error = job.get("error")
+                done = job.get("done")
+
+                if error:
+                    # GPU failed; use fallback
+                    fallback = quick_plan.remote(query, persona_context)
+                    return {"response": fallback, "mode": "cpu_fallback"}
+
+                if chunks and len(chunks) > last_len:
+                    # Return latest partial to keep latency low
+                    text = "".join(chunks)
+                    last_len = len(chunks)
+                    if done:
+                        return {"response": text, "mode": "gpu_stream"}
+                    # If not done but we have enough to be useful, return now
+                    if len(text) > 300:
+                        return {"response": text, "mode": "gpu_partial"}
+
+                time.sleep(0.5)
+
+            # If timeout/no chunks, fallback
+            fallback = quick_plan.remote(query, persona_context)
+            return {"response": fallback, "mode": "cpu_fallback_timeout"}
                 
         except Exception as e:
             return {"error": f"Internal server error: {str(e)}"}
